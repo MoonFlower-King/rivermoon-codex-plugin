@@ -1,0 +1,20 @@
+{
+  "name": "rivermoon",
+  "interface": {
+    "displayName": "RiverMoon"
+  },
+  "plugins": [
+    {
+      "name": "rivermoon",
+      "source": {
+        "source": "local",
+        "path": "./plugins/rivermoon"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Creative"
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "rivermoon",
+  "version": "0.1.0",
+  "description": "Generate and edit images in Codex through RiverMoon GPT Image 2.",
+  "author": {
+    "name": "RiverMoon",
+    "url": "https://rivermoon7.com/"
+  },
+  "homepage": "https://rivermoon7.com/",
+  "keywords": ["image", "gpt-image-2", "generation", "editing"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "RiverMoon Image",
+    "shortDescription": "GPT Image 2 generation and editing",
+    "longDescription": "Generate and edit images with RiverMoon using standard and professional quality groups.",
+    "developerName": "RiverMoon",
+    "category": "Creative",
+    "capabilities": ["Image generation", "Image editing"],
+    "websiteURL": "https://rivermoon7.com/",
+    "defaultPrompt": [
+      "Use RiverMoon to generate a product image.",
+      "Edit this image with RiverMoon.",
+      "Create a high-quality 4K image with RiverMoon."
+    ],
+    "brandColor": "#147D64"
+  },
+  "mcpServers": "./.mcp.json"
+}

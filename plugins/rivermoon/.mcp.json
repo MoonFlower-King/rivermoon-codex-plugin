@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "rivermoon-image": {
+      "type": "http",
+      "url": "https://rivermoon7.com/codex-mcp",
+      "auth": "oauth"
+    }
+  }
+}
