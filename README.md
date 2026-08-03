@@ -7,8 +7,11 @@ This repository contains the first RiverMoon image plugin for Codex and its OAut
 Run this single command, then start a new Codex session:
 
 ```bash
-codex plugin marketplace add MoonFlower-King/rivermoon-codex-plugin && codex plugin add rivermoon@rivermoon
+codex plugin marketplace add https://rivermoon7.com/codex-marketplace/rivermoon/ && codex plugin add rivermoon@rivermoon
 ```
+
+This primary source is hosted by RiverMoon and does not require access to GitHub. The repository at
+`MoonFlower-King/rivermoon-codex-plugin` remains available as a public mirror.
 
 Codex opens the RiverMoon authorization page when authentication is needed. Sign in with an existing
 RiverMoon account, or create one at [rivermoon7.com/register](https://rivermoon7.com/register).
