@@ -31,8 +31,11 @@ export interface AuthorizationCode {
   userId: number;
   username: string;
   encryptedNewApiSession: string;
-  encryptedStandardKey: string;
-  encryptedProKey: string;
+  /** Encrypted upstream key per channel id, e.g. standard, pro, video. */
+  encryptedKeys: Record<string, string>;
+  /** Written by gateways before channels existed; read only for migration. */
+  encryptedStandardKey?: string;
+  encryptedProKey?: string;
   expiresAt: number;
 }
 
@@ -44,8 +47,11 @@ export interface AccessGrant {
   userId: number;
   username: string;
   encryptedNewApiSession: string;
-  encryptedStandardKey: string;
-  encryptedProKey: string;
+  /** Encrypted upstream key per channel id, e.g. standard, pro, video. */
+  encryptedKeys: Record<string, string>;
+  /** Written by gateways before channels existed; read only for migration. */
+  encryptedStandardKey?: string;
+  encryptedProKey?: string;
   expiresAt: number;
 }
 

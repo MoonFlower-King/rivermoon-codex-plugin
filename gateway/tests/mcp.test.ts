@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { describeAccount, isSupportedSize } from "../src/mcp.js";
+import { encryptString } from "../src/crypto.js";
+import { authorizeGrant, describeAccount, isSupportedSize } from "../src/mcp.js";
+import type { AccessGrant } from "../src/store.js";
 
 describe("size validation", () => {
   it("accepts auto and sizes inside the supported range", () => {
@@ -50,5 +52,52 @@ describe("describeAccount", () => {
 
     expect(described.text).toContain("Remaining balance: unavailable");
     expect(described.structured.remaining_usd).toBeUndefined();
+  });
+});
+
+describe("authorizeGrant", () => {
+  const config = loadConfig({ NODE_ENV: "test" });
+
+  function grant(extra: Partial<AccessGrant>): AccessGrant {
+    return {
+      tokenHash: "hash",
+      clientId: "rm_test",
+      scope: "image:generate",
+      resource: "https://rivermoon7.com/codex-mcp",
+      userId: 1,
+      username: "rivermoon",
+      encryptedNewApiSession: encryptString("session=test", config.encryptionKey),
+      encryptedKeys: {},
+      expiresAt: Date.now() + 60_000,
+      ...extra,
+    };
+  }
+
+  it("decrypts every channel key", () => {
+    const user = authorizeGrant(
+      config,
+      grant({
+        encryptedKeys: {
+          standard: encryptString("sk-standard", config.encryptionKey),
+          video: encryptString("sk-video", config.encryptionKey),
+        },
+      }),
+    );
+
+    expect(user.keys).toEqual({ standard: "sk-standard", video: "sk-video" });
+  });
+
+  it("keeps a grant issued before channels existed working", () => {
+    const user = authorizeGrant(
+      config,
+      grant({
+        encryptedKeys: undefined as unknown as Record<string, string>,
+        encryptedStandardKey: encryptString("sk-old-standard", config.encryptionKey),
+        encryptedProKey: encryptString("sk-old-pro", config.encryptionKey),
+      }),
+    );
+
+    expect(user.keys).toEqual({ standard: "sk-old-standard", pro: "sk-old-pro" });
+    expect(user.keys.video).toBeUndefined();
   });
 });

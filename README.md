@@ -1,6 +1,8 @@
-# RiverMoon Codex Image Plugin
+# RiverMoon Codex Media Plugin
 
-This repository contains the first RiverMoon image plugin for Codex and its OAuth-protected MCP gateway.
+This repository contains the RiverMoon image and video plugin for Codex and its OAuth-protected MCP
+gateway. It puts a RiverMoon relay's image and video models into Codex behind a browser login, so a
+user installs one plugin and signs in instead of configuring API keys, base URLs, and model names.
 
 ## Install
 
@@ -18,11 +20,12 @@ RiverMoon account, or create one at [rivermoon7.com/register](https://rivermoon7
 
 ## Features
 
-- GPT Image 2 generation and editing
+- Image generation and editing
+- Video generation, text-to-video and image-to-video, with task polling
 - `standard` tier routed through the NewAPI `default` group
 - `pro` tier routed through the NewAPI `4k` group
 - Browser OAuth login backed by existing RiverMoon accounts
-- Automatic creation of two user-owned, `gpt-image-2`-limited API tokens
+- Automatic creation of user-owned, model-limited API tokens, one per configured channel
 - Encrypted upstream credentials and hashed OAuth access tokens
 - Timeouts and bounded retries on every upstream call
 - Short-lived download links for images too large to inline
@@ -39,6 +42,32 @@ professional, final, highest-quality, or 4K output use `pro`.
 - `n` (1-4) works for both generation and editing.
 - `account_status` reports the remaining balance in USD, plus an estimated image count when
   `STANDARD_IMAGE_COST_USD` and `PRO_IMAGE_COST_USD` are set.
+
+### Video
+
+Video is off until `VIDEO_MODELS` lists at least one model the relay exposes. When it is empty the
+gateway never advertises `generate_video` or `check_video`, so a relay without video channels is
+unaffected.
+
+Video jobs are asynchronous: the gateway submits to `POST /v1/video/generations`, waits up to
+`VIDEO_INLINE_WAIT_MS`, and either returns the finished URL or a `task_id` the model polls with
+`check_video` against `GET /v1/video/generations/{task_id}`. A finished clip is always a URL, never
+inline content.
+
+Task queries need NewAPI with [QuantumNous/new-api#5133](https://github.com/QuantumNous/new-api/pull/5133).
+Older releases refuse a task query made with a model-limited token; the gateway detects that
+response and says so instead of reporting a bad credential.
+
+### Channels
+
+`config.ts` builds a channel list from the environment, and each channel becomes one model-limited
+token on the user's RiverMoon account. Adding a capability is a configuration change:
+
+| Channel | Group | Models |
+| --- | --- | --- |
+| `standard` | `STANDARD_GROUP` | `IMAGE_MODEL` |
+| `pro` | `PRO_GROUP` | `IMAGE_MODEL` |
+| `video` | `VIDEO_GROUP` | `VIDEO_MODELS` |
 
 ### Large images
 

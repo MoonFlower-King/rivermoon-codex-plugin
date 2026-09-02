@@ -199,7 +199,10 @@ export function createOAuthRouter(
     pending: PendingAuthorization,
     result: Extract<LoginResult, { kind: "success" }>,
   ): Promise<void> {
-    const imageTokens = await newApi.ensureImageTokens(result.sessionCookie, result.user.id);
+    const channelKeys = await newApi.ensureChannelTokens(result.sessionCookie, result.user.id);
+    const encryptedKeys = Object.fromEntries(
+      Object.entries(channelKeys).map(([id, key]) => [id, encryptString(key, config.encryptionKey)]),
+    );
     const rawCode = randomToken(32);
     const code: AuthorizationCode = {
       codeHash: tokenHash(rawCode),
@@ -211,8 +214,7 @@ export function createOAuthRouter(
       userId: result.user.id,
       username: result.user.username,
       encryptedNewApiSession: encryptString(result.sessionCookie, config.encryptionKey),
-      encryptedStandardKey: encryptString(imageTokens.standardKey, config.encryptionKey),
-      encryptedProKey: encryptString(imageTokens.proKey, config.encryptionKey),
+      encryptedKeys,
       expiresAt: Date.now() + 5 * 60_000,
     };
     await store.putCode(code);
@@ -307,8 +309,7 @@ export function createOAuthRouter(
         userId: code.userId,
         username: code.username,
         encryptedNewApiSession: code.encryptedNewApiSession,
-        encryptedStandardKey: code.encryptedStandardKey,
-        encryptedProKey: code.encryptedProKey,
+        encryptedKeys: code.encryptedKeys,
       });
       return res.json({
         access_token: issued.accessToken,
@@ -333,8 +334,7 @@ export function createOAuthRouter(
         userId: previous.userId,
         username: previous.username,
         encryptedNewApiSession: previous.encryptedNewApiSession,
-        encryptedStandardKey: previous.encryptedStandardKey,
-        encryptedProKey: previous.encryptedProKey,
+        encryptedKeys: previous.encryptedKeys,
       });
       return res.json({
         access_token: issued.accessToken,

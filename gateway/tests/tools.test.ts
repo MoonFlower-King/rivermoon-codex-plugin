@@ -18,12 +18,10 @@ const user: AuthorizedUser = {
     userId: 1,
     username: "rivermoon",
     encryptedNewApiSession: "",
-    encryptedStandardKey: "",
-    encryptedProKey: "",
+    encryptedKeys: {},
     expiresAt: Date.now() + 60_000,
   },
-  standardKey: "sk-standard",
-  proKey: "sk-pro",
+  keys: { standard: "sk-standard", pro: "sk-pro", video: "sk-video" },
   newApiSession: "session=test",
 };
 
@@ -111,6 +109,148 @@ describe("advertised tools", () => {
     } finally {
       await close();
       await rm(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+const videoEnv = {
+  VIDEO_MODELS: "kling-v1,veo-3",
+  VIDEO_POLL_INTERVAL_MS: "5",
+};
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+describe("video tools", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("stays hidden on a relay with no video models configured", async () => {
+    const { client, close } = await connectedClient();
+    try {
+      const names = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(names).not.toContain("generate_video");
+      expect(names).not.toContain("check_video");
+    } finally {
+      await close();
+    }
+  });
+
+  it("appears once video models are configured", async () => {
+    const { client, close } = await connectedClient(videoEnv);
+    try {
+      const names = (await client.listTools()).tools.map((tool) => tool.name).sort();
+      expect(names).toEqual([
+        "account_status",
+        "check_video",
+        "edit_image",
+        "generate_image",
+        "generate_video",
+      ]);
+    } finally {
+      await close();
+    }
+  });
+
+  it("polls until the job finishes and returns the video URL", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ task_id: "t-1", status: "processing" }, 201))
+      .mockResolvedValueOnce(jsonResponse({ task_id: "t-1", status: "in_progress" }))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          task_id: "t-1",
+          status: "succeeded",
+          url: "https://cdn.example/v.mp4",
+          format: "mp4",
+          metadata: { duration: 5 },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { client, close } = await connectedClient({ ...videoEnv, VIDEO_INLINE_WAIT_MS: "60000" });
+    try {
+      const result = await client.callTool({
+        name: "generate_video",
+        arguments: { prompt: "an astronaut walking on the moon", duration: 5 },
+      });
+
+      expect(result.isError).toBeFalsy();
+      expect(JSON.stringify(result.content)).toContain("https://cdn.example/v.mp4");
+      expect(result.structuredContent).toMatchObject({ task_id: "t-1", status: "succeeded" });
+
+      const submit = fetchMock.mock.calls[0];
+      expect(String(submit[0])).toContain("/v1/video/generations");
+      expect(JSON.parse(String(submit[1]?.body))).toMatchObject({
+        model: "kling-v1",
+        prompt: "an astronaut walking on the moon",
+        duration: 5,
+      });
+    } finally {
+      await close();
+    }
+  });
+
+  it("hands back a task id with a do-not-resubmit warning when the job outlives the wait budget", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ task_id: "t-2", status: "queued" }, 201));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { client, close } = await connectedClient({ ...videoEnv, VIDEO_INLINE_WAIT_MS: "1" });
+    try {
+      const result = await client.callTool({
+        name: "generate_video",
+        arguments: { prompt: "a river at night" },
+      });
+
+      expect(result.isError).toBeFalsy();
+      const text = JSON.stringify(result.content);
+      expect(text).toContain("t-2");
+      expect(text).toContain("check_video");
+      expect(text).toContain("do not resubmit");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      await close();
+    }
+  });
+
+  it("surfaces a failed job as an error instead of a silent success", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(
+          jsonResponse({ task_id: "t-3", status: "failed", error: { message: "content rejected" } }),
+        ),
+    );
+
+    const { client, close } = await connectedClient(videoEnv);
+    try {
+      const result = await client.callTool({ name: "check_video", arguments: { task_id: "t-3" } });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain("content rejected");
+    } finally {
+      await close();
+    }
+  });
+
+  it("rejects a model the relay does not offer", async () => {
+    const { client, close } = await connectedClient(videoEnv);
+    try {
+      const result = await client.callTool({
+        name: "generate_video",
+        arguments: { prompt: "a river", model: "sora-2" },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain("model must be one of");
+    } finally {
+      await close();
     }
   });
 });

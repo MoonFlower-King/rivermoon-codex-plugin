@@ -1,4 +1,4 @@
-import type { AppConfig } from "./config.js";
+import type { AppConfig, UpstreamChannel } from "./config.js";
 import { fetchWithRetry, type RetryPolicy } from "./http.js";
 
 interface ApiEnvelope<T> {
@@ -24,6 +24,18 @@ interface TokenItem {
   name: string;
   group: string;
   status: number;
+}
+
+export type VideoStatus = "queued" | "processing" | "in_progress" | "succeeded" | "failed";
+
+export interface VideoTask {
+  taskId: string;
+  status: VideoStatus;
+  url?: string;
+  format?: string;
+  model?: string;
+  metadata?: Record<string, unknown>;
+  error?: string;
 }
 
 export interface ImageResult {
@@ -178,20 +190,19 @@ export class NewApiClient {
   private async createToken(
     sessionCookie: string,
     userId: number,
-    name: string,
-    group: string,
+    channel: UpstreamChannel,
   ): Promise<void> {
     await this.sessionRequest<unknown>("/api/token/", sessionCookie, userId, {
       method: "POST",
       body: JSON.stringify({
-        name,
+        name: channel.tokenName,
         expired_time: -1,
         remain_quota: 0,
         unlimited_quota: true,
         model_limits_enabled: true,
-        model_limits: "gpt-image-2",
+        model_limits: channel.models.join(","),
         allow_ips: "",
-        group,
+        group: channel.group,
         cross_group_retry: false,
       }),
     });
@@ -208,38 +219,35 @@ export class NewApiClient {
     return result.key;
   }
 
-  async ensureImageTokens(
+  /**
+   * Provision one model-limited token per configured channel and return the raw
+   * keys by channel id. Adding a capability is a config change, not a code one.
+   */
+  async ensureChannelTokens(
     sessionCookie: string,
     userId: number,
-  ): Promise<{ standardKey: string; proKey: string }> {
+  ): Promise<Record<string, string>> {
     let tokens = await this.listTokens(sessionCookie, userId);
-    const requirements = [
-      { name: this.config.standardTokenName, group: this.config.standardGroup },
-      { name: this.config.proTokenName, group: this.config.proGroup },
-    ];
 
-    for (const requirement of requirements) {
+    for (const channel of this.config.channels) {
       const existing = tokens.find(
-        (token) => token.name === requirement.name && token.group === requirement.group,
+        (token) => token.name === channel.tokenName && token.group === channel.group,
       );
       if (!existing) {
-        await this.createToken(sessionCookie, userId, requirement.name, requirement.group);
+        await this.createToken(sessionCookie, userId, channel);
         tokens = await this.listTokens(sessionCookie, userId);
       }
     }
 
-    const standard = tokens.find(
-      (token) => token.name === this.config.standardTokenName && token.group === this.config.standardGroup,
-    );
-    const pro = tokens.find(
-      (token) => token.name === this.config.proTokenName && token.group === this.config.proGroup,
-    );
-    if (!standard || !pro) throw new Error("Unable to provision RiverMoon image tokens");
-
-    return {
-      standardKey: await this.tokenKey(sessionCookie, userId, standard.id),
-      proKey: await this.tokenKey(sessionCookie, userId, pro.id),
-    };
+    const keys: Record<string, string> = {};
+    for (const channel of this.config.channels) {
+      const token = tokens.find(
+        (candidate) => candidate.name === channel.tokenName && candidate.group === channel.group,
+      );
+      if (!token) throw new Error(`Unable to provision the RiverMoon ${channel.id} token`);
+      keys[channel.id] = await this.tokenKey(sessionCookie, userId, token.id);
+    }
+    return keys;
   }
 
   private async imageRequest(
@@ -325,6 +333,101 @@ export class NewApiClient {
     }
 
     return this.imageRequest("/v1/images/edits", apiKey, () => ({ method: "POST", body: form }));
+  }
+
+  private videoUrl(path: string): string {
+    return `${this.config.videoApiBaseUrl}${path}`;
+  }
+
+  /**
+   * NewAPI rejects a task query made with a model-limited key on releases before
+   * QuantumNous/new-api#5133, which is easy to mistake for a bad token.
+   */
+  private videoError(error: unknown): Error {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/no access to model/i.test(message)) {
+      return new Error(
+        `${message} — the RiverMoon video token is model-limited and this NewAPI release cannot read the model on a task query. Upgrade NewAPI (fix: QuantumNous/new-api#5133).`,
+      );
+    }
+    return error instanceof Error ? error : new Error(message);
+  }
+
+  private normalizeVideoTask(body: Record<string, unknown>, fallbackId?: string): VideoTask {
+    const taskId = String(body.task_id ?? body.id ?? fallbackId ?? "");
+    if (!taskId) throw new Error("RiverMoon video API did not return a task id");
+
+    const raw = String(body.status ?? "queued").toLowerCase();
+    const status: VideoStatus =
+      raw === "completed" || raw === "success" || raw === "succeeded"
+        ? "succeeded"
+        : raw === "failed" || raw === "error"
+          ? "failed"
+          : raw === "processing" || raw === "in_progress"
+            ? "in_progress"
+            : "queued";
+
+    const error = body.error;
+    return {
+      taskId,
+      status,
+      url: typeof body.url === "string" ? body.url : undefined,
+      format: typeof body.format === "string" ? body.format : undefined,
+      model: typeof body.model === "string" ? body.model : undefined,
+      metadata: (body.metadata as Record<string, unknown> | undefined) ?? undefined,
+      error:
+        typeof error === "string"
+          ? error
+          : error && typeof error === "object"
+            ? String((error as { message?: unknown }).message ?? JSON.stringify(error))
+            : undefined,
+    };
+  }
+
+  async createVideoTask(
+    apiKey: string,
+    input: {
+      model: string;
+      prompt: string;
+      image?: string;
+      duration?: number;
+      size?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<VideoTask> {
+    const body: Record<string, unknown> = { model: input.model, prompt: input.prompt };
+    if (input.image) body.image = input.image;
+    if (input.duration !== undefined) body.duration = input.duration;
+    if (input.size && input.size !== "auto") body.size = input.size;
+    if (input.metadata && Object.keys(input.metadata).length > 0) body.metadata = input.metadata;
+
+    try {
+      const response = await fetchWithRetry(
+        this.videoUrl("/v1/video/generations"),
+        () => ({
+          method: "POST",
+          headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        this.imagePolicy,
+      );
+      return this.normalizeVideoTask(await this.parseJson<Record<string, unknown>>(response));
+    } catch (error) {
+      throw this.videoError(error);
+    }
+  }
+
+  async getVideoTask(apiKey: string, taskId: string): Promise<VideoTask> {
+    try {
+      const response = await fetchWithRetry(
+        this.videoUrl(`/v1/video/generations/${encodeURIComponent(taskId)}`),
+        () => ({ headers: { authorization: `Bearer ${apiKey}` } }),
+        this.readPolicy,
+      );
+      return this.normalizeVideoTask(await this.parseJson<Record<string, unknown>>(response), taskId);
+    } catch (error) {
+      throw this.videoError(error);
+    }
   }
 
   private async loadImage(value: string): Promise<{

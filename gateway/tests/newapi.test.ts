@@ -12,7 +12,7 @@ function response(data: unknown): Response {
 describe("NewApiClient", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it("provisions model-limited standard and 4k tokens", async () => {
+  it("provisions one model-limited token per configured channel", async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(response({ items: [] }))
@@ -34,9 +34,9 @@ describe("NewApiClient", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const client = new NewApiClient(loadConfig({ NODE_ENV: "test" }));
-    const keys = await client.ensureImageTokens("session=test", 123);
+    const keys = await client.ensureChannelTokens("session=test", 123);
 
-    expect(keys).toEqual({ standardKey: "sk-standard", proKey: "sk-pro" });
+    expect(keys).toEqual({ standard: "sk-standard", pro: "sk-pro" });
     const createBodies = fetchMock.mock.calls
       .filter(([, init]) => init?.method === "POST" && String(init.body).includes("model_limits"))
       .map(([, init]) => JSON.parse(String(init?.body)));
@@ -59,6 +59,61 @@ describe("NewApiClient", () => {
 
     const client = new NewApiClient(loadConfig({ NODE_ENV: "test" }));
     await expect(client.login("wrong", "wrong")).rejects.toThrow("用户名或密码错误");
+  });
+
+  it("provisions a video token limited to the configured video models", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        response({
+          items: [
+            { id: 10, name: "rivermoon-codex-standard", group: "default", status: 1 },
+            { id: 11, name: "rivermoon-codex-pro", group: "4k", status: 1 },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(response(null))
+      .mockResolvedValueOnce(
+        response({
+          items: [
+            { id: 10, name: "rivermoon-codex-standard", group: "default", status: 1 },
+            { id: 11, name: "rivermoon-codex-pro", group: "4k", status: 1 },
+            { id: 12, name: "rivermoon-codex-video", group: "default", status: 1 },
+          ],
+        }),
+      )
+      .mockResolvedValueOnce(response({ key: "sk-standard" }))
+      .mockResolvedValueOnce(response({ key: "sk-pro" }))
+      .mockResolvedValueOnce(response({ key: "sk-video" }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new NewApiClient(
+      loadConfig({ NODE_ENV: "test", VIDEO_MODELS: "kling-v1, veo-3" }),
+    );
+    const keys = await client.ensureChannelTokens("session=test", 123);
+
+    expect(keys).toEqual({ standard: "sk-standard", pro: "sk-pro", video: "sk-video" });
+    const created = fetchMock.mock.calls
+      .filter(([, init]) => init?.method === "POST" && String(init.body).includes("model_limits"))
+      .map(([, init]) => JSON.parse(String(init?.body)));
+    expect(created).toEqual([
+      expect.objectContaining({ name: "rivermoon-codex-video", model_limits: "kling-v1,veo-3" }),
+    ]);
+  });
+
+  it("explains the NewAPI model-limit bug when a task query is refused", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(JSON.stringify({ error: { message: "This token has no access to model" } }), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const client = new NewApiClient(loadConfig({ NODE_ENV: "test", VIDEO_MODELS: "kling-v1" }));
+    await expect(client.getVideoTask("sk-video", "t-1")).rejects.toThrow(/new-api#5133/);
   });
 
   it("retries an image request that was rejected before billing", async () => {
