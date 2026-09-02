@@ -3,12 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { ArtifactStore } from "../src/artifacts.js";
 import { createApplication } from "../src/app.js";
 import { loadConfig } from "../src/config.js";
 
 describe("RiverMoon gateway", () => {
   let tempDir: string;
   let app: Awaited<ReturnType<typeof createApplication>>["app"];
+  let artifacts: ArtifactStore;
 
   beforeAll(async () => {
     tempDir = await mkdtemp(path.join(os.tmpdir(), "rivermoon-gateway-"));
@@ -17,7 +19,7 @@ describe("RiverMoon gateway", () => {
       PUBLIC_BASE_URL: "https://rivermoon7.com",
       STATE_FILE: path.join(tempDir, "state.json"),
     });
-    ({ app } = await createApplication(config));
+    ({ app, artifacts } = await createApplication(config));
   });
 
   afterAll(async () => {
@@ -71,6 +73,21 @@ describe("RiverMoon gateway", () => {
       .expect(200);
 
     expect(response.text).toContain("https://rivermoon7.com/register");
+  });
+
+  it("serves a stored oversized image at its download link", async () => {
+    const stored = await artifacts.save(Buffer.from("webp-bytes"), "image/webp");
+
+    const response = await request(app).get(`/codex-files/${stored!.id}`).expect(200);
+
+    expect(response.headers["content-type"]).toContain("image/webp");
+    expect(response.headers["cache-control"]).toContain("no-store");
+    expect(response.body).toEqual(Buffer.from("webp-bytes"));
+  });
+
+  it("returns 404 for an unknown or expired image download link", async () => {
+    await request(app).get(`/codex-files/${"a".repeat(32)}`).expect(404);
+    await request(app).get("/codex-files/not-an-id").expect(404);
   });
 
   it("rejects an MCP request without OAuth", async () => {

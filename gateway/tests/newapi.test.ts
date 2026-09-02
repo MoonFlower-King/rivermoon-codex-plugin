@@ -60,4 +60,76 @@ describe("NewApiClient", () => {
     const client = new NewApiClient(loadConfig({ NODE_ENV: "test" }));
     await expect(client.login("wrong", "wrong")).rejects.toThrow("用户名或密码错误");
   });
+
+  it("retries an image request that was rejected before billing", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response("rate limited", { status: 429 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ data: [{ b64_json: "aGk=" }], model: "gpt-image-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new NewApiClient(loadConfig({ NODE_ENV: "test", RETRY_BASE_DELAY_MS: "1" }));
+    const result = await client.generateImage("sk-standard", {
+      prompt: "a cat",
+      size: "auto",
+      quality: "auto",
+      outputFormat: "png",
+      n: 1,
+    });
+
+    expect(result.data).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry an image request that may have been billed", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ error: { message: "upstream exploded" } }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new NewApiClient(loadConfig({ NODE_ENV: "test", RETRY_BASE_DELAY_MS: "1" }));
+    await expect(
+      client.generateImage("sk-standard", {
+        prompt: "a cat",
+        size: "auto",
+        quality: "auto",
+        outputFormat: "png",
+        n: 1,
+      }),
+    ).rejects.toThrow("upstream exploded");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends the requested image count when editing", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ data: [{ b64_json: "aGk=" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = new NewApiClient(loadConfig({ NODE_ENV: "test" }));
+    await client.editImage("sk-pro", {
+      prompt: "make it night",
+      images: [Buffer.from("png-bytes").toString("base64")],
+      size: "1024x1024",
+      quality: "high",
+      outputFormat: "png",
+      n: 3,
+    });
+
+    const form = fetchMock.mock.calls[0][1]?.body as FormData;
+    expect(form.get("n")).toBe("3");
+    expect(form.get("size")).toBe("1024x1024");
+    expect(form.get("image")).toBeInstanceOf(Blob);
+  });
 });

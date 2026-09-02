@@ -1,5 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { ArtifactStore } from "./artifacts.js";
 import type { AppConfig } from "./config.js";
 import { tokenHash } from "./crypto.js";
 import { authorizeGrant, createMcpServer, type AuthorizedUser } from "./mcp.js";
@@ -18,6 +19,11 @@ declare global {
 export async function createApplication(config: AppConfig) {
   const store = await GatewayStore.open(config.stateFile);
   const newApi = new NewApiClient(config);
+  const artifacts = new ArtifactStore(
+    config.artifactDir,
+    config.artifactTtlSeconds * 1000,
+    config.artifactMaxTotalBytes,
+  );
   const app = express();
   app.disable("x-powered-by");
   app.set("trust proxy", 1);
@@ -26,7 +32,22 @@ export async function createApplication(config: AppConfig) {
   app.use(createOAuthRouter(config, store, newApi));
 
   app.get("/healthz", (_req, res) => {
-    res.json({ status: "ok", service: "rivermoon-codex-image", version: "0.1.0" });
+    res.json({ status: "ok", service: "rivermoon-codex-image", version: "0.2.0" });
+  });
+
+  // Oversized generated images are handed out here. The 128-bit id is the only
+  // credential, and the file expires with the artifact store's TTL.
+  app.get(`${config.filesPath}/:id`, async (req, res) => {
+    const artifact = await artifacts.resolve(req.params.id);
+    if (!artifact) {
+      res.status(404).json({ error: "not_found", message: "This RiverMoon image link has expired" });
+      return;
+    }
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Content-Type", artifact.mimeType);
+    res.setHeader("Content-Disposition", "inline");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.sendFile(artifact.filePath);
   });
 
   const requireAccessToken = (req: Request, res: Response, next: NextFunction) => {
@@ -51,7 +72,7 @@ export async function createApplication(config: AppConfig) {
   };
 
   app.post(config.mcpPath, requireAccessToken, async (req, res) => {
-    const server = createMcpServer(config, newApi, req.rivermoonUser!);
+    const server = createMcpServer(config, newApi, artifacts, req.rivermoonUser!);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
       await server.connect(transport);
@@ -85,7 +106,10 @@ export async function createApplication(config: AppConfig) {
     res.status(500).json({ error: "server_error", message: "RiverMoon gateway error" });
   });
 
-  const pruneTimer = setInterval(() => void store.prune(), 10 * 60_000);
+  const pruneTimer = setInterval(() => {
+    void store.prune();
+    void artifacts.prune();
+  }, 10 * 60_000);
   pruneTimer.unref();
-  return { app, store, newApi };
+  return { app, store, newApi, artifacts };
 }

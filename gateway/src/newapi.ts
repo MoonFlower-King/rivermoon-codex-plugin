@@ -1,4 +1,5 @@
 import type { AppConfig } from "./config.js";
+import { fetchWithRetry, type RetryPolicy } from "./http.js";
 
 interface ApiEnvelope<T> {
   success?: boolean;
@@ -36,8 +37,44 @@ export interface ImageResult {
   created?: number;
 }
 
+/**
+ * Image generation is charged per call, so it only retries statuses that mean
+ * the request was rejected before any image was produced.
+ */
+const IMAGE_RETRY_STATUS: ReadonlySet<number> = new Set([429, 502, 503, 504]);
+
 export class NewApiClient {
   constructor(private readonly config: AppConfig) {}
+
+  /** Idempotent reads: safe to retry, including after a timeout. */
+  private get readPolicy(): RetryPolicy {
+    return {
+      timeoutMs: this.config.upstreamTimeoutMs,
+      retries: this.config.upstreamRetries,
+      baseDelayMs: this.config.retryBaseDelayMs,
+      maxDelayMs: this.config.retryMaxDelayMs,
+      retryOnTimeout: true,
+    };
+  }
+
+  /** Logins and token creation: a retry could duplicate a completed write. */
+  private get writePolicy(): RetryPolicy {
+    return { ...this.readPolicy, retries: 0, retryOnTimeout: false };
+  }
+
+  private get imagePolicy(): RetryPolicy {
+    return {
+      ...this.readPolicy,
+      timeoutMs: this.config.imageTimeoutMs,
+      retryOnTimeout: false,
+      retryStatuses: IMAGE_RETRY_STATUS,
+    };
+  }
+
+  /** Downloading an image the upstream already produced. */
+  get downloadPolicy(): RetryPolicy {
+    return this.readPolicy;
+  }
 
   private async parseJson<T>(response: Response): Promise<T> {
     const text = await response.text();
@@ -65,11 +102,15 @@ export class NewApiClient {
   }
 
   async login(username: string, password: string): Promise<LoginResult> {
-    const response = await fetch(`${this.config.newApiBaseUrl}/api/user/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username, password }),
-    });
+    const response = await fetchWithRetry(
+      `${this.config.newApiBaseUrl}/api/user/login`,
+      () => ({
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      }),
+      this.writePolicy,
+    );
     const body = await this.parseJson<ApiEnvelope<LoginUser>>(response);
     if (!body.success) throw new Error(body.message || "用户名或密码错误");
     const cookie = this.sessionCookie(response);
@@ -79,14 +120,18 @@ export class NewApiClient {
   }
 
   async verifyTwoFactor(sessionCookie: string, code: string): Promise<LoginResult> {
-    const response = await fetch(`${this.config.newApiBaseUrl}/api/user/login/2fa`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        cookie: sessionCookie,
-      },
-      body: JSON.stringify({ code }),
-    });
+    const response = await fetchWithRetry(
+      `${this.config.newApiBaseUrl}/api/user/login/2fa`,
+      () => ({
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: sessionCookie,
+        },
+        body: JSON.stringify({ code }),
+      }),
+      this.writePolicy,
+    );
     const body = await this.parseJson<ApiEnvelope<LoginUser>>(response);
     if (!body.success || !body.data?.id) throw new Error(body.message || "两步验证码无效");
     const cookie = this.sessionCookie(response);
@@ -99,15 +144,19 @@ export class NewApiClient {
     userId: number,
     init: RequestInit = {},
   ): Promise<T> {
-    const response = await fetch(`${this.config.newApiBaseUrl}${path}`, {
-      ...init,
-      headers: {
-        cookie: sessionCookie,
-        "New-Api-User": String(userId),
-        ...(init.body ? { "content-type": "application/json" } : {}),
-        ...init.headers,
-      },
-    });
+    const response = await fetchWithRetry(
+      `${this.config.newApiBaseUrl}${path}`,
+      () => ({
+        ...init,
+        headers: {
+          cookie: sessionCookie,
+          "New-Api-User": String(userId),
+          ...(init.body ? { "content-type": "application/json" } : {}),
+          ...init.headers,
+        },
+      }),
+      init.method && init.method !== "GET" ? this.writePolicy : this.readPolicy,
+    );
     const body = await this.parseJson<ApiEnvelope<T>>(response);
     if (!body.success) throw new Error(body.message || "RiverMoon account request failed");
     return body.data as T;
@@ -193,14 +242,25 @@ export class NewApiClient {
     };
   }
 
-  private async imageRequest(path: string, apiKey: string, init: RequestInit): Promise<ImageResult> {
-    const response = await fetch(`${this.config.imageApiBaseUrl}${path}`, {
-      ...init,
-      headers: {
-        authorization: `Bearer ${apiKey}`,
-        ...init.headers,
+  private async imageRequest(
+    path: string,
+    apiKey: string,
+    init: () => RequestInit,
+  ): Promise<ImageResult> {
+    const response = await fetchWithRetry(
+      `${this.config.imageApiBaseUrl}${path}`,
+      () => {
+        const request = init();
+        return {
+          ...request,
+          headers: {
+            authorization: `Bearer ${apiKey}`,
+            ...request.headers,
+          },
+        };
       },
-    });
+      this.imagePolicy,
+    );
     const body = await this.parseJson<ImageResult & { error?: { message?: string } }>(response);
     if (body.error?.message) throw new Error(body.error.message);
     if (!Array.isArray(body.data) || body.data.length === 0) {
@@ -219,7 +279,7 @@ export class NewApiClient {
       n: number;
     },
   ): Promise<ImageResult> {
-    return this.imageRequest("/v1/images/generations", apiKey, {
+    return this.imageRequest("/v1/images/generations", apiKey, () => ({
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -231,7 +291,7 @@ export class NewApiClient {
         response_format: "b64_json",
         n: input.n,
       }),
-    });
+    }));
   }
 
   async editImage(
@@ -242,6 +302,7 @@ export class NewApiClient {
       size: string;
       quality: string;
       outputFormat: string;
+      n: number;
     },
   ): Promise<ImageResult> {
     const form = new FormData();
@@ -251,6 +312,7 @@ export class NewApiClient {
     form.set("quality", input.quality);
     form.set("output_format", input.outputFormat);
     form.set("response_format", "b64_json");
+    form.set("n", String(input.n));
 
     for (let index = 0; index < input.images.length; index += 1) {
       const image = await this.loadImage(input.images[index]);
@@ -262,7 +324,7 @@ export class NewApiClient {
       );
     }
 
-    return this.imageRequest("/v1/images/edits", apiKey, { method: "POST", body: form });
+    return this.imageRequest("/v1/images/edits", apiKey, () => ({ method: "POST", body: form }));
   }
 
   private async loadImage(value: string): Promise<{
@@ -271,7 +333,7 @@ export class NewApiClient {
     extension: string;
   }> {
     if (/^https?:\/\//i.test(value)) {
-      const response = await fetch(value);
+      const response = await fetchWithRetry(value, () => ({}), this.downloadPolicy);
       if (!response.ok) throw new Error(`Unable to download reference image (${response.status})`);
       const mimeType = response.headers.get("content-type")?.split(";", 1)[0] || "image/png";
       return {
