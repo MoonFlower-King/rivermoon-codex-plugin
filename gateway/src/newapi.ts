@@ -1,4 +1,5 @@
 import type { AppConfig } from "./config.js";
+import { fetchPublicHttps } from "./net.js";
 
 interface ApiEnvelope<T> {
   success?: boolean;
@@ -271,11 +272,15 @@ export class NewApiClient {
     extension: string;
   }> {
     if (/^https?:\/\//i.test(value)) {
-      const response = await fetch(value);
-      if (!response.ok) throw new Error(`Unable to download reference image (${response.status})`);
-      const mimeType = response.headers.get("content-type")?.split(";", 1)[0] || "image/png";
+      // User-supplied URL: only public HTTPS hosts, bounded size and time (SSRF guard).
+      const remote = await fetchPublicHttps(value, {
+        maxBytes: this.config.maxInlineImageBytes,
+        timeoutMs: 30_000,
+      });
+      const mimeType = remote.contentType?.split(";", 1)[0] || "image/png";
+      if (!mimeType.startsWith("image/")) throw new Error("Reference URL did not return an image");
       return {
-        bytes: new Uint8Array(await response.arrayBuffer()),
+        bytes: remote.bytes,
         mimeType,
         extension: mimeType.split("/", 2)[1] || "png",
       };

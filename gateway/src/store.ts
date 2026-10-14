@@ -62,6 +62,9 @@ interface DatabaseShape {
   refreshTokens: Record<string, RefreshGrant>;
 }
 
+/** Registered clients with no pending request or token are removed after this long. */
+const UNUSED_CLIENT_TTL_MS = 24 * 60 * 60_000;
+
 const EMPTY_DATABASE: DatabaseShape = {
   clients: {},
   pending: {},
@@ -188,6 +191,19 @@ export class GatewayStore {
       }
       for (const [hash, token] of Object.entries(data.refreshTokens)) {
         if (token.expiresAt <= now) delete data.refreshTokens[hash];
+      }
+      // Dynamic registration is unauthenticated, so drop clients that never obtained a grant.
+      const activeClients = new Set<string>();
+      for (const grant of [
+        ...Object.values(data.pending),
+        ...Object.values(data.codes),
+        ...Object.values(data.accessTokens),
+        ...Object.values(data.refreshTokens),
+      ]) {
+        activeClients.add(grant.clientId);
+      }
+      for (const [id, client] of Object.entries(data.clients)) {
+        if (!activeClients.has(id) && client.createdAt + UNUSED_CLIENT_TTL_MS <= now) delete data.clients[id];
       }
     });
   }
