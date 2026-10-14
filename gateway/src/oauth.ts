@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import type { AppConfig } from "./config.js";
 import { decryptString, encryptString, pkceChallenge, randomToken, tokenHash } from "./crypto.js";
 import { NewApiClient, type LoginResult } from "./newapi.js";
+import { RateLimiter } from "./rate-limit.js";
 import {
   GatewayStore,
   type AccessGrant,
@@ -11,6 +12,8 @@ import {
 } from "./store.js";
 
 const SUPPORTED_SCOPES = ["image:generate", "image:edit", "account:read"];
+const PENDING_TTL_MS = 10 * 60_000;
+const TOO_MANY_ATTEMPTS = "尝试次数过多，请稍后再试。";
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => {
@@ -104,6 +107,13 @@ export function createOAuthRouter(
   newApi: NewApiClient,
 ): Router {
   const router = Router();
+  // Brute-force and spam guards: per client IP and per username/request.
+  const loginByIp = new RateLimiter(20, 10 * 60_000);
+  const loginByUser = new RateLimiter(10, 10 * 60_000);
+  const twoFactorByRequest = new RateLimiter(5, 10 * 60_000);
+  const registerByIp = new RateLimiter(20, 60 * 60_000);
+  const authorizeByIp = new RateLimiter(60, 10 * 60_000);
+  const clientIp = (req: Request) => req.ip ?? req.socket.remoteAddress ?? "unknown";
 
   router.get("/.well-known/oauth-protected-resource", (_req, res) => {
     res.json({
@@ -131,6 +141,9 @@ export function createOAuthRouter(
   });
 
   router.post(`${config.oauthPrefix}/register`, async (req, res) => {
+    if (!registerByIp.take(clientIp(req))) {
+      return oauthError(res, 429, "slow_down", "Too many client registrations, try again later");
+    }
     const redirectUris = Array.isArray(req.body?.redirect_uris)
       ? req.body.redirect_uris.filter((value: unknown): value is string => typeof value === "string")
       : [];
@@ -154,6 +167,9 @@ export function createOAuthRouter(
   });
 
   router.get(`${config.oauthPrefix}/authorize`, async (req, res) => {
+    if (!authorizeByIp.take(clientIp(req))) {
+      return oauthError(res, 429, "slow_down", "Too many authorization requests, try again later");
+    }
     const clientId = String(req.query.client_id ?? "");
     const redirectUri = String(req.query.redirect_uri ?? "");
     const responseType = String(req.query.response_type ?? "");
@@ -228,11 +244,17 @@ export function createOAuthRouter(
   router.post(`${config.oauthPrefix}/login`, async (req, res) => {
     const requestId = String(req.body?.request_id ?? "");
     const pending = store.getPending(requestId);
-    if (!pending || pending.createdAt + 10 * 60_000 <= Date.now()) {
+    if (!pending || pending.createdAt + PENDING_TTL_MS <= Date.now()) {
       return res.status(400).type("html").send(loginPage(requestId, "授权请求已过期，请返回 Codex 重试。"));
     }
+    const username = String(req.body?.username ?? "");
+    const ipAllowed = loginByIp.take(clientIp(req));
+    const userAllowed = loginByUser.take(username.trim().toLowerCase());
+    if (!ipAllowed || !userAllowed) {
+      return res.status(429).type("html").send(loginPage(requestId, TOO_MANY_ATTEMPTS));
+    }
     try {
-      const result = await newApi.login(String(req.body?.username ?? ""), String(req.body?.password ?? ""));
+      const result = await newApi.login(username, String(req.body?.password ?? ""));
       if (result.kind === "2fa") {
         await store.updatePending(requestId, {
           encryptedNewApiSession: encryptString(result.sessionCookie, config.encryptionKey),
@@ -249,8 +271,11 @@ export function createOAuthRouter(
   router.post(`${config.oauthPrefix}/login/2fa`, async (req, res) => {
     const requestId = String(req.body?.request_id ?? "");
     const pending = store.getPending(requestId);
-    if (!pending?.encryptedNewApiSession) {
+    if (!pending?.encryptedNewApiSession || pending.createdAt + PENDING_TTL_MS <= Date.now()) {
       return res.status(400).type("html").send(twoFactorPage(requestId, "两步验证会话已过期。"));
+    }
+    if (!twoFactorByRequest.take(requestId) || !loginByIp.take(clientIp(req))) {
+      return res.status(429).type("html").send(twoFactorPage(requestId, TOO_MANY_ATTEMPTS));
     }
     try {
       const session = decryptString(pending.encryptedNewApiSession, config.encryptionKey);

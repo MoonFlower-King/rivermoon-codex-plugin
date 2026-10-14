@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { AppConfig } from "./config.js";
 import { decryptString } from "./crypto.js";
 import { NewApiClient, type ImageResult } from "./newapi.js";
+import { readBodyLimited } from "./net.js";
 import type { AccessGrant } from "./store.js";
 
 export interface AuthorizedUser {
@@ -26,10 +27,18 @@ async function imageContent(
     let encoded = item.b64_json;
     let mimeType = item.mime_type || "image/png";
     if (!encoded && item.url) {
-      const response = await fetch(item.url);
+      const response = await fetch(item.url, { signal: AbortSignal.timeout(60_000) });
       if (!response.ok) throw new Error(`Unable to download generated image (${response.status})`);
       mimeType = response.headers.get("content-type")?.split(";", 1)[0] || mimeType;
-      encoded = Buffer.from(await response.arrayBuffer()).toString("base64");
+      try {
+        encoded = Buffer.from(await readBodyLimited(response, maxInlineBytes)).toString("base64");
+      } catch {
+        content.push({
+          type: "text",
+          text: `The generated image is too large to inline. Download it from ${item.url}`,
+        });
+        continue;
+      }
     }
     if (!encoded) continue;
     const byteLength = Buffer.byteLength(encoded, "base64");
